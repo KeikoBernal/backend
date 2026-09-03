@@ -1,0 +1,35 @@
+// src/server.js
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+require('dotenv').config();
+
+const db = require('./config/db');
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+// Middlewares de seguridad
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+
+// Ruta de prueba para verificar que el servidor y la BD responden
+app.get('/api/health', async (req, res) => {
+  try {
+    const result = await db.query('SELECT NOW()');
+    res.json({
+      status: 'success',
+      mensaje: 'Servidor activo y conectado a Supabase con éxito',
+      timestamp_db: result.rows[0].now
+    });
+  } catch (error) {
+    console.error('Error al conectar con la base de datos:', error);
+    res.status(500).json({ status: 'error', mensaje: 'No hay conexión con la base de datos' });
+  }
+});
+
+// Iniciar servidor
+app.listen(PORT, () => {
+  console.log(`Servidor corriendo en el puerto ${PORT}`);
+});

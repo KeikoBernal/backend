@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "postinstall": "prisma skills sync || exit 0"
   },
   "keywords": [],
   "author": "",
@@ -15,7 +16,19 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
     "pg": "^8.23.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KeikoBernal/backend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KeikoBernal/backend/issues"
+  },
+  "homepage": "https://github.com/KeikoBernal/backend#readme",
+  "devDependencies": {
+    "nodemon": "^3.1.14"
   }
 }
