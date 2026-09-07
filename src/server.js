@@ -1,4 +1,3 @@
-// src/server.js
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -11,7 +10,11 @@ const PORT = process.env.PORT || 4000;
 
 // Middlewares de seguridad
 app.use(helmet());
-app.use(cors());
+app.use(cors({
+  origin: '*', // O puedes poner los dominios permitidos de tu frontend en Vercel
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // Ruta de prueba para verificar que el servidor y la BD responden
