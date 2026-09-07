@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 4000;
 // Middlewares de seguridad
 app.use(helmet());
 app.use(cors({
-  origin: '*', // O puedes poner los dominios permitidos de tu frontend en Vercel
+  origin: '*', 
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
