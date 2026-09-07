@@ -32,6 +32,7 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+
 const authRoutes = require('./routes/authRoutes');
 app.use('/api', authRoutes);
 
@@ -40,6 +41,9 @@ app.use('/api/superadmin', superadminRoutes);
 
 const adminLigaRoutes = require('./routes/adminLigaRoutes');
 app.use('/api/admin-liga', adminLigaRoutes);
+
+const authRoutes = require('./routes/authRoutes');
+app.use('/api', authRoutes);
 
 // Iniciar servidor
 app.listen(PORT, () => {
