@@ -42,9 +42,6 @@ app.use('/api/superadmin', superadminRoutes);
 const adminLigaRoutes = require('./routes/adminLigaRoutes');
 app.use('/api/admin-liga', adminLigaRoutes);
 
-const authRoutes = require('./routes/authRoutes');
-app.use('/api', authRoutes);
-
 // Iniciar servidor
 app.listen(PORT, () => {
   console.log(`Servidor corriendo en el puerto ${PORT}`);
