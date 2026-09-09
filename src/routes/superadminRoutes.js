@@ -102,18 +102,112 @@ router.get('/ligas', async (req, res) => {
   }
 });
 
-router.post('/ligas', async (req, res) => {
-  const { nombre, responsable_nombre, responsable_telefono, responsable_email, logo_url } = req.body;
+// 1. NUEVA SOLICITUD: Endpoint para ver información detallada de la liga
+router.get('/ligas/:id/detalle', async (req, res) => {
+  const { id } = req.params;
   try {
+    const liga = await db.query('SELECT * FROM public.organizaciones WHERE id = $1', [id]);
+    if (liga.rows.length === 0) return res.status(404).json({ error: 'Liga no encontrada.' });
+
+    const usuarios = await db.query('SELECT id, nombre, apellido, email, rol, cedula FROM public.usuarios WHERE organizacion_id = $1', [id]);
+    const equipos = await db.query('SELECT * FROM public.equipos WHERE organizacion_id = $1', [id]);
+    const sedes = await db.query('SELECT * FROM public.sedes WHERE organizacion_id = $1', [id]);
+    const torneos = await db.query('SELECT * FROM public.torneos WHERE organizacion_id = $1', [id]);
+    
+    // Obtenemos los jugadores a través de los equipos de esa liga
+    const jugadores = await db.query(`
+      SELECT j.*, e.nombre as equipo_nombre 
+      FROM public.jugadores j 
+      JOIN public.equipos e ON j.equipo_id = e.id 
+      WHERE e.organizacion_id = $1
+    `, [id]);
+
+    // Obtenemos partidos vinculados a los torneos de esa liga
+    const partidos = await db.query(`
+      SELECT p.*, t.nombre as torneo_nombre, el.nombre as local_nombre, ev.nombre as visita_nombre 
+      FROM public.partidos p
+      JOIN public.torneos t ON p.torneo_id = t.id
+      JOIN public.equipos el ON p.equipo_local_id = el.id
+      JOIN public.equipos ev ON p.equipo_visita_id = ev.id
+      WHERE t.organizacion_id = $1
+    `, [id]);
+
+    res.json({
+      liga: liga.rows[0],
+      usuarios: usuarios.rows,
+      equipos: equipos.rows,
+      sedes: sedes.rows,
+      torneos: torneos.rows,
+      jugadores: jugadores.rows,
+      partidos: partidos.rows
+    });
+  } catch (error) {
+    console.error('Error al obtener detalle de la liga:', error);
+    res.status(500).json({ error: 'Error al consultar la información detallada.' });
+  }
+});
+
+// 2. NUEVA SOLICITUD: Creación de Liga y usuario Administrador al mismo tiempo
+router.post('/ligas', async (req, res) => {
+  const { nombre, responsable_nombre, responsable_apellido, responsable_cedula, responsable_telefono, responsable_email, logo_url } = req.body;
+  
+  if (!nombre || !responsable_nombre || !responsable_apellido || !responsable_cedula || !responsable_email) {
+    return res.status(400).json({ error: 'Faltan datos obligatorios de la liga o del responsable (nombre, apellido, cédula, correo).' });
+  }
+
+  const cedulaLimpia = responsable_cedula.trim();
+  if (!/^\d{5,8}$/.test(cedulaLimpia)) {
+    return res.status(400).json({ error: 'La cédula del responsable debe ser exclusivamente numérica de 5 a 8 dígitos.' });
+  }
+
+  try {
+    // A. Insertamos la Organización en la tabla original
     const resDb = await db.query(
       `INSERT INTO public.organizaciones (nombre, responsable_nombre, responsable_telefono, responsable_email, logo_url) 
        VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [nombre.trim(), responsable_nombre.trim(), responsable_telefono.trim(), responsable_email.trim().toLowerCase(), logo_url || null]
+      [nombre.trim(), responsable_nombre.trim(), responsable_telefono?.trim(), responsable_email.trim().toLowerCase(), logo_url || null]
     );
-    await registrarAuditoria(req.usuario.id, 'CREAR_LIGA', 'organizaciones', null, resDb.rows[0], req.ip);
-    res.status(201).json({ mensaje: 'Liga creada con éxito', liga: resDb.rows[0] });
+    const organizacionId = resDb.rows[0].id;
+
+    // B. Creamos el Usuario Auth en Supabase
+    const primerNombre = responsable_nombre.trim().split(' ')[0];
+    const passwordInicial = `${primerNombre}${cedulaLimpia.substring(0, 5)}!`;
+
+    const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
+      email: responsable_email.trim().toLowerCase(),
+      password: passwordInicial,
+      email_confirm: true,
+      user_metadata: { 
+        rol: 'Administrador de Liga',
+        nombre: responsable_nombre.trim(),
+        apellido: responsable_apellido.trim(),
+        cedula: cedulaLimpia,
+        debe_cambiar_password: true
+      }
+    });
+
+    if (authError) {
+      // Si falla la creación del usuario, deshacemos la creación de la liga para evitar registros huérfanos
+      await db.query('DELETE FROM public.organizaciones WHERE id = $1', [organizacionId]);
+      return res.status(400).json({ error: `Error creando credencial: ${authError.message}` });
+    }
+
+    // C. Insertamos el Administrador en la tabla usuarios local
+    await db.query(
+      `INSERT INTO public.usuarios (id, email, rol, nombre, apellido, cedula, organizacion_id, debe_cambiar_password) 
+       VALUES ($1, $2, 'Administrador de Liga', $3, $4, $5, $6, true)`,
+      [authUser.user.id, responsable_email.trim().toLowerCase(), responsable_nombre.trim(), responsable_apellido.trim(), cedulaLimpia, organizacionId]
+    );
+
+    await registrarAuditoria(req.usuario.id, 'CREAR_LIGA_Y_ADMIN', 'organizaciones', null, { ...resDb.rows[0], adminId: authUser.user.id }, req.ip);
+    
+    res.status(201).json({ 
+      mensaje: `Liga creada con éxito. Contraseña del Administrador: ${passwordInicial}`, 
+      liga: resDb.rows[0] 
+    });
   } catch (error) {
-    res.status(500).json({ error: 'Error al crear la liga.' });
+    console.error('Error al registrar liga y administrador:', error);
+    res.status(500).json({ error: 'Error general al crear la liga y su cuenta administradora.' });
   }
 });
 
@@ -132,14 +226,24 @@ router.put('/ligas/:id', async (req, res) => {
       [nombre, responsable_nombre, responsable_telefono, responsable_email, estado_activa, id]
     );
 
+    // NUEVO: Bloquear/Desbloquear usuarios si el estado de la liga cambió
+    if (estado_activa !== previa.rows[0].estado_activa) {
+      const banStatus = estado_activa ? 'none' : '876000h'; // none = activo, 876000h = baneado por 100 años
+      const usuariosLiga = await db.query('SELECT id FROM public.usuarios WHERE organizacion_id = $1', [id]);
+      
+      for (const u of usuariosLiga.rows) {
+        await supabaseAdmin.auth.admin.updateUserById(u.id, { ban_duration: banStatus });
+      }
+    }
+
     await registrarAuditoria(req.usuario.id, 'EDITAR_LIGA', 'organizaciones', previa.rows[0], resDb.rows[0], req.ip);
-    res.json({ mensaje: 'Liga actualizada con éxito', liga: resDb.rows[0] });
+    res.json({ mensaje: `Liga actualizada. Usuarios ${estado_activa ? 'habilitados' : 'deshabilitados'}.`, liga: resDb.rows[0] });
   } catch (error) {
     res.status(500).json({ error: 'Error al actualizar la liga.' });
   }
 });
 
-// Eliminar Liga solicitando clave de confirmación
+// Eliminar Liga solicitando clave de confirmación (Se adapta el mensaje de error para cascada)
 router.delete('/ligas/:id', async (req, res) => {
   const { id } = req.params;
   const { password } = req.body;
@@ -165,10 +269,10 @@ router.delete('/ligas/:id', async (req, res) => {
     await db.query('DELETE FROM public.organizaciones WHERE id = $1', [id]);
     await registrarAuditoria(req.usuario.id, 'ELIMINAR_LIGA', 'organizaciones', previa.rows[0], null, req.ip);
     
-    res.json({ mensaje: 'Liga eliminada con éxito.' });
+    res.json({ mensaje: 'Liga y todos sus registros vinculados han sido eliminados en cascada con éxito.' });
   } catch (error) {
     console.error('Error al eliminar liga:', error);
-    res.status(500).json({ error: 'No se puede eliminar la liga. Asegúrate de que no tenga usuarios ni partidos vinculados.' });
+    res.status(500).json({ error: 'Error en la base de datos al intentar eliminar la liga y sus registros.' });
   }
 });
 
@@ -300,7 +404,6 @@ router.post('/usuarios/:id/reset-password', async (req, res) => {
   }
 });
 
-// Eliminar Usuario solicitando clave de confirmación
 router.delete('/usuarios/:id', async (req, res) => {
   const { id } = req.params;
   const { password } = req.body;
@@ -313,7 +416,6 @@ router.delete('/usuarios/:id', async (req, res) => {
     return res.status(400).json({ error: 'No puedes eliminar tu propia cuenta de Superadmin.' });
   }
 
-  // Validar credenciales del Superadmin
   const { error: authError } = await supabaseAuth.auth.signInWithPassword({
     email: req.usuario.email,
     password
