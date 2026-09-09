@@ -164,31 +164,63 @@ router.post('/jugadores', async (req, res) => {
 
 router.put('/jugadores/:id', async (req, res) => {
   const { id } = req.params;
-  const { nombre, apellido, cedula, fecha_nacimiento, correo, telefono, numero_dorsal, foto_url } = req.body;
+  const { nombre, apellido, cedula, fecha_nacimiento, correo, telefono, numero_dorsal, foto_url, es_capitan } = req.body;
+  
   if (cedula && !/^\d{5,8}$/.test(cedula.trim())) {
     return res.status(400).json({ error: 'La cédula debe ser numérica de 5 a 8 dígitos.' });
   }
+  
   try {
     const jugadorPrevio = await db.query('SELECT equipo_id FROM public.jugadores WHERE id = $1', [id]);
     if (jugadorPrevio.rows.length === 0) return res.status(404).json({ error: 'Jugador no encontrado.' });
+    
     const equipoId = jugadorPrevio.rows[0].equipo_id;
+    
     if (numero_dorsal) {
       const dorsalNum = parseInt(numero_dorsal);
-      const dorsalCheck = await db.query(`SELECT id FROM public.jugadores WHERE equipo_id = $1 AND numero_dorsal = $2 AND id != $3 AND estado = 'Activo'`, [equipoId, dorsalNum, id]);
+      const dorsalCheck = await db.query(
+        `SELECT id FROM public.jugadores WHERE equipo_id = $1 AND numero_dorsal = $2 AND id != $3 AND estado = 'Activo'`, 
+        [equipoId, dorsalNum, id]
+      );
       if (dorsalCheck.rows.length > 0) {
         return res.status(400).json({ error: `El dorsal #${dorsalNum} ya está en uso por otro jugador activo.` });
       }
     }
+
+    // 1. Actualizar los datos generales del jugador
     const resDb = await db.query(
       `UPDATE public.jugadores 
        SET nombre = COALESCE($1, nombre), apellido = COALESCE($2, apellido), cedula = COALESCE($3, cedula), 
            fecha_nacimiento = COALESCE($4, fecha_nacimiento), correo = COALESCE($5, correo), 
            telefono = COALESCE($6, telefono), numero_dorsal = COALESCE($7, numero_dorsal), foto_url = COALESCE($8, foto_url)
        WHERE id = $9 RETURNING *`,
-      [nombre ? formatearTexto(nombre) : null, apellido ? formatearTexto(apellido) : null, cedula?.trim(), fecha_nacimiento, correo?.trim(), telefono?.trim(), numero_dorsal ? parseInt(numero_dorsal) : null, foto_url, id]
+      [
+        nombre ? formatearTexto(nombre) : null, 
+        apellido ? formatearTexto(apellido) : null, 
+        cedula?.trim(), 
+        fecha_nacimiento, 
+        correo?.trim(), 
+        telefono?.trim(), 
+        numero_dorsal ? parseInt(numero_dorsal) : null, 
+        foto_url, 
+        id
+      ]
     );
-    res.json({ mensaje: 'Jugador actualizado con éxito.', jugador: resDb.rows[0] });
-  } catch (error) { res.status(500).json({ error: 'Error actualizando jugador.' }); }
+
+    // 2. Gestionar la exclusividad del Capitán para el equipo
+    if (es_capitan) {
+      // Si se marca como capitán, se asigna (esto sobrescribe automáticamente al capitán anterior, garantizando que solo haya uno)
+      await db.query(`UPDATE public.equipos SET capitan_id = $1 WHERE id = $2`, [id, equipoId]);
+    } else {
+      // Si se desmarca, verificamos si era el capitán actual para dejar el campo en NULL
+      await db.query(`UPDATE public.equipos SET capitan_id = NULL WHERE id = $1 AND capitan_id = $2`, [equipoId, id]);
+    }
+
+    res.json({ mensaje: 'Jugador y capitanía actualizados con éxito.', jugador: resDb.rows[0] });
+  } catch (error) { 
+    console.error('Error actualizando jugador:', error);
+    res.status(500).json({ error: 'Error actualizando jugador.' }); 
+  }
 });
 
 router.put('/jugadores/:id/estado', async (req, res) => {
