@@ -81,4 +81,16 @@ router.get('/partidos/:id', async (req, res) => {
   }
 });
 
+router.get('/partidos/:id/nomina-publica', async (req, res) => {
+  try {
+    const resDb = await db.query(`
+      SELECT j.*, e.nombre AS equipo_nombre FROM public.jugadores j
+      JOIN public.equipos e ON j.equipo_id = e.id
+      JOIN public.partidos p ON (p.equipo_local_id = e.id OR p.equipo_visita_id = e.id)
+      WHERE p.id = $1 AND j.estado = 'Activo' ORDER BY e.nombre, j.numero_dorsal ASC
+    `, [req.params.id]);
+    res.json(resDb.rows);
+  } catch (error) { res.status(500).json({ error: 'Error' }); }
+});
+
 module.exports = router;

@@ -1,129 +1,135 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
-const { createClient } = require('@supabase/supabase-js');
-const { verificarToken, autorizarRoles } = require('../middleware/authMiddleware');
+const { verificarToken } = require('../middleware/authMiddleware');
 
-const supabaseAdmin = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY
-);
+router.use(verificarToken);
 
-// 1. Middleware de protección para roles operativos (Árbitros y Anotadores)
-router.use(verificarToken, autorizarRoles('arbitro', 'árbitro', 'anotador', 'arbitro/anotador', 'árbitro / anotador'));
-
-// 2. Ruta de Cambio Obligatorio de Contraseña (Idéntica a Admin de Liga)
-router.post('/cambiar-password-obligatorio', async (req, res) => {
-  const { nueva_password } = req.body;
-  if (!nueva_password || nueva_password.length < 6) {
-    return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres.' });
-  }
-  try {
-    const userId = req.usuario?.id || req.user?.id;
-    if (!userId) return res.status(401).json({ error: 'Usuario no autenticado.' });
-
-    const { error } = await supabaseAdmin.auth.admin.updateUserById(userId, {
-      password: nueva_password,
-      user_metadata: { debe_cambiar_password: false }
-    });
-    
-    if (error) return res.status(400).json({ error: error.message });
-    
-    await db.query('UPDATE public.usuarios SET debe_cambiar_password = false WHERE id = $1', [userId]);
-    res.json({ mensaje: 'Contraseña actualizada con éxito.' });
-  } catch (error) {
-    console.error('Error al cambiar contraseña:', error);
-    res.status(500).json({ error: 'Error al cambiar la contraseña.' });
-  }
-});
-
-// 3. Obtener Partidos Asignados
+// 1. OBTENER MIS PARTIDOS
 router.get('/mis-partidos', async (req, res) => {
   try {
-    const usuarioId = req.usuario?.id || req.user?.id;
-    const query = `
-      SELECT p.id, p.fecha_hora, p.estado, p.equipo_local_id, p.equipo_visita_id,
-             t.nombre as torneo_nombre, s.nombre as sede_nombre, 
-             el.nombre as local_nombre, ev.nombre as visita_nombre
+    const usuarioId = req.usuario.id;
+    const esAdmin = ['Administrador de Liga', 'Superadmin'].includes(req.usuario.rol || '');
+
+    let query = `
+      SELECT p.*, 
+             el.nombre AS local_nombre, ev.nombre AS visita_nombre,
+             t.nombre AS torneo_nombre, s.nombre AS sede_nombre,
+             COALESCE(ua.nombre || ' ' || ua.apellido, 'Por definir') AS arbitro_nombre,
+             COALESCE(un.nombre || ' ' || un.apellido, 'Por definir') AS anotador_nombre,
+             COALESCE(jl_p.nombre || ' ' || jl_p.apellido, jl_e.nombre || ' ' || jl_e.apellido, 'Por definir') AS capitan_local_nombre,
+             COALESCE(jv_p.nombre || ' ' || jv_p.apellido, jv_e.nombre || ' ' || jv_e.apellido, 'Por definir') AS capitan_visita_nombre
       FROM public.partidos p
-      JOIN public.torneos t ON p.torneo_id = t.id
-      JOIN public.sedes s ON p.sede_id = s.id
-      JOIN public.equipos el ON p.equipo_local_id = el.id
-      JOIN public.equipos ev ON p.equipo_visita_id = ev.id
-      WHERE (p.arbitro_id = $1 OR p.anotador_id = $1) AND p.estado != 'Finalizado'
-      ORDER BY p.fecha_hora ASC
+      LEFT JOIN public.equipos el ON p.equipo_local_id = el.id
+      LEFT JOIN public.equipos ev ON p.equipo_visita_id = ev.id
+      LEFT JOIN public.torneos t ON p.torneo_id = t.id
+      LEFT JOIN public.sedes s ON p.sede_id = s.id
+      LEFT JOIN public.usuarios ua ON p.arbitro_id = ua.id
+      LEFT JOIN public.usuarios un ON p.anotador_id = un.id
+      LEFT JOIN public.jugadores jl_p ON p.capitan_local_id = jl_p.id
+      LEFT JOIN public.jugadores jl_e ON el.capitan_id = jl_e.id
+      LEFT JOIN public.jugadores jv_p ON p.capitan_visita_id = jv_p.id
+      LEFT JOIN public.jugadores jv_e ON ev.capitan_id = jv_e.id
     `;
-    const resultado = await db.query(query, [usuarioId]);
-    res.json(resultado.rows);
+    const params = [];
+    if (!esAdmin) { query += ` WHERE p.arbitro_id = $1 OR p.anotador_id = $1 `; params.push(usuarioId); }
+    query += ` ORDER BY p.fecha_hora DESC `;
+
+    const resDb = await db.query(query, params);
+    res.json(resDb.rows);
+  } catch (error) { res.status(500).json({ error: 'Error consultando partidos asignados.' }); }
+});
+
+// ==========================================
+// 2. INICIAR PARTIDO
+// ==========================================
+router.put('/partidos/:id/iniciar', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { hora_inicio } = req.body; // Recibida del dispositivo o generada como respaldo
+
+    const horaParaGuardar = new Date();
+
+    const resDb = await db.query(
+      `UPDATE public.partidos 
+       SET estado = 'En Curso', 
+           hora_inicio = COALESCE(hora_inicio, $1)
+       WHERE id = $2 
+       RETURNING *, TO_CHAR(hora_inicio, 'HH12:MI AM') AS hora_inicio_fmt`,
+      [horaParaGuardar, id]
+    );
+
+    if (resDb.rows.length === 0) {
+      return res.status(404).json({ error: 'Partido no encontrado.' });
+    }
+
+    const partido = resDb.rows[0];
+    const horaFinalStr = hora_inicio || partido.hora_inicio_fmt || new Date().toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+    res.json({
+      mensaje: 'Partido iniciado con éxito.',
+      partido: partido,
+      hora_inicio: horaFinalStr
+    });
   } catch (error) {
-    console.error('Error en /mis-partidos:', error);
-    res.status(500).json({ error: 'Error interno al cargar la agenda de partidos.' });
+    console.error('Error iniciando partido:', error);
+    res.status(500).json({ error: 'Error al cambiar estado del partido.' });
   }
 });
 
-// 4. Obtener Nómina de Jugadores
-router.get('/partidos/:id/nomina', async (req, res) => {
-  const partidoId = req.params.id;
+// ==========================================
+// 3. FINALIZAR PARTIDO
+// ==========================================
+
+router.put('/partidos/:id/finalizar', async (req, res) => {
   try {
-    const partidoData = await db.query('SELECT equipo_local_id, equipo_visita_id FROM public.partidos WHERE id = $1', [partidoId]);
-    if (partidoData.rows.length === 0) return res.status(404).json({ error: 'Partido no encontrado.' });
-    
-    const { equipo_local_id, equipo_visita_id } = partidoData.rows[0];
-    const queryJugadores = `
-      SELECT j.id, j.nombre, j.apellido, j.numero_dorsal, j.equipo_id, j.foto_url, e.nombre as equipo
+    const { id } = req.params;
+    const { hora_final } = req.body;
+
+    const resDb = await db.query(
+      `UPDATE public.partidos 
+       SET estado = 'Finalizado', 
+           hora_final = $1 
+       WHERE id = $2 
+       RETURNING *`,
+      [hora_final, id]
+    );
+
+    if (resDb.rows.length === 0) {
+      return res.status(404).json({ error: 'Partido no encontrado.' });
+    }
+
+    res.json({
+      mensaje: 'Partido finalizado con éxito.',
+      partido: resDb.rows[0],
+      hora_final: hora_final
+    });
+  } catch (error) {
+    console.error('Error finalizando partido:', error);
+    res.status(500).json({ error: 'Error al finalizar el partido.' });
+  }
+});
+
+// 4. SUSPENDER PARTIDO (Solo Árbitro)
+router.put('/partidos/:id/suspender', async (req, res) => {
+  try {
+    const resDb = await db.query(`UPDATE public.partidos SET estado = 'Suspendido' WHERE id = $1 RETURNING *`, [req.params.id]);
+    res.json({ mensaje: 'Partido suspendido.', partido: resDb.rows[0] });
+  } catch (error) { res.status(500).json({ error: 'Error al suspender el partido.' }); }
+});
+
+// 5. NÓMINA DEL PARTIDO
+router.get('/partidos/:id/nomina', async (req, res) => {
+  try {
+    const resDb = await db.query(`
+      SELECT j.*, e.nombre AS equipo_nombre
       FROM public.jugadores j
       JOIN public.equipos e ON j.equipo_id = e.id
-      WHERE (j.equipo_id = $1 OR j.equipo_id = $2) AND j.estado = 'Activo'
-      ORDER BY j.equipo_id, j.numero_dorsal ASC
-    `;
-    const resultadoJugadores = await db.query(queryJugadores, [equipo_local_id, equipo_visita_id]);
-    res.json(resultadoJugadores.rows);
-  } catch (error) {
-    console.error('Error en /nomina:', error);
-    res.status(500).json({ error: 'Error interno al cargar los jugadores.' });
-  }
-});
-
-// 5. Validaciones pendientes de cambios de resultado
-router.get('/mis-validaciones', async (req, res) => {
-  try {
-    const usuarioId = req.usuario?.id || req.user?.id;
-    const query = `
-      SELECT p.id as partido_id, t.nombre as torneo_nombre, el.nombre as local, ev.nombre as visita, 
-             COALESCE(r.motivo_cambio, 'Sin motivo especificado') as motivo_cambio, 
-             r.ganador_propuesto_id, 
-             COALESCE(r.estado_validacion, 'Pendiente') as estado_validacion, 
-             eg.nombre as nuevo_ganador_nombre
-      FROM public.partidos p
-      JOIN public.torneos t ON p.torneo_id = t.id
-      JOIN public.equipos el ON p.equipo_local_id = el.id
-      JOIN public.equipos ev ON p.equipo_visita_id = ev.id
-      LEFT JOIN public.resultados r ON r.partido_id = p.id
-      LEFT JOIN public.equipos eg ON r.ganador_propuesto_id = eg.id
-      WHERE p.arbitro_id = $1 AND (r.estado_validacion = 'Pendiente' OR r.estado_validacion IS NULL)
-    `;
-    const resultado = await db.query(query, [usuarioId]);
-    res.json(resultado.rows);
-  } catch (error) { 
-    console.error('Error en /mis-validaciones:', error);
-    res.json([]); 
-  }
-});
-
-router.post('/validar-cambio/:partido_id', async (req, res) => {
-  const { aprobado } = req.body;
-  try {
-    if (aprobado) {
-      await db.query(`UPDATE public.resultados SET equipo_ganador_id = ganador_propuesto_id, estado_validacion = 'Validado' WHERE partido_id = $1`, [req.params.partido_id]);
-      res.json({ mensaje: 'Cambio de resultado APROBADO e impactado.' });
-    } else {
-      await db.query(`UPDATE public.resultados SET estado_validacion = 'Rechazado' WHERE partido_id = $1`, [req.params.partido_id]);
-      res.json({ mensaje: 'Cambio RECHAZADO.' });
-    }
-  } catch (error) { 
-    console.error('Error en /validar-cambio:', error);
-    res.status(500).json({ error: 'Error procesando validación.' }); 
-  }
+      JOIN public.partidos p ON (p.equipo_local_id = e.id OR p.equipo_visita_id = e.id)
+      WHERE p.id = $1 AND j.estado = 'Activo' ORDER BY e.nombre, j.numero_dorsal ASC
+    `, [req.params.id]);
+    res.json(resDb.rows);
+  } catch (error) { res.status(500).json({ error: 'Error al obtener nómina.' }); }
 });
 
 module.exports = router;
