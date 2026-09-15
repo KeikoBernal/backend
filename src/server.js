@@ -2,8 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 require('dotenv').config();
-const http = require('http'); // 1. Importamos el módulo HTTP nativo de Node
-const { Server } = require('socket.io'); // 2. Importamos Socket.io
+const http = require('http'); 
+const { Server } = require('socket.io'); 
 
 const db = require('./config/db');
 
@@ -13,16 +13,16 @@ const PORT = process.env.PORT || 4000;
 // Middlewares de seguridad
 app.use(helmet());
 app.use(cors({
-  origin: '*', // En producción, cambia '*' por la URL de tu frontend (ej. 'https://misistema.unexpo.edu.ve')
+  origin: '*', 
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
 
-// 3. Crear el servidor HTTP vinculándolo con Express
+// Crear el servidor HTTP vinculándolo con Express
 const server = http.createServer(app);
 
-// 4. Inicializar Socket.io con el servidor HTTP
+// Inicializar Socket.io con el servidor HTTP
 const io = new Server(server, {
   cors: {
     origin: '*', 
@@ -58,37 +58,151 @@ app.use('/api/admin-liga', adminLigaRoutes);
 const operativoRoutes = require('./routes/operativoRoutes');
 app.use('/api/operativo', operativoRoutes);
 
+const publicRoutes = require('./routes/publicRoutes');
+app.use('/api/publico', publicRoutes); 
+
+const mensajeriaRoutes = require('./routes/mensajeriaRoutes'); // Asegúrate de que el nombre coincida con tu archivo en la carpeta routes
+app.use('/api/mensajeria', mensajeriaRoutes);
+
 // ==========================================
-// 5. LÓGICA DE WEBSOCKETS (TIEMPO REAL)
+// ESTADO EN MEMORIA PARA LA PLANILLA EN VIVO
+// ==========================================
+const partidosEnMemoria = {};
+
+// ==========================================
+// LÓGICA DE WEBSOCKETS (TIEMPO REAL)
 // ==========================================
 io.on('connection', (socket) => {
   console.log(`🟢 Nuevo cliente conectado: ${socket.id}`);
 
-  // 5.1. Aislar las comunicaciones creando una "sala" (room) por partido
+  // --- SISTEMA DE MENSAJERÍA JERÁRQUICA ---
+  socket.on('registrar_usuario_mensajeria', (data) => {
+    const { id, rol } = data;
+    if (id) socket.join(`usuario_${id}`);
+    
+    // NORMALIZAR ROL PARA EVITAR ERRORES DE ACENTOS Y MAYÚSCULAS[cite: 27]
+    if (rol) {
+      const normalizedRol = rol.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      socket.join(`rol_${normalizedRol}`);
+      console.log(`💬 Cliente ${socket.id} registrado en mensajería como: usuario_${id} y rol_${normalizedRol}`);
+    }
+  });
+
+  socket.on('enviar_mensaje', (data) => {
+    const { destinatario_sala, remitente, mensaje, timestamp, cc_admin } = data;
+    
+    if (Array.isArray(destinatario_sala)) {
+      destinatario_sala.forEach(sala => {
+        const nombreSala = (sala.startsWith('rol_') || sala.startsWith('usuario_')) ? sala : `usuario_${sala}`;
+        io.to(nombreSala).emit('nuevo_mensaje', { remitente, mensaje, timestamp, destinatario_sala: nombreSala, propio: false });
+      });
+    } else {
+      io.to(destinatario_sala).emit('nuevo_mensaje', { remitente, mensaje, timestamp, destinatario_sala, propio: false });
+    }
+
+    if (cc_admin) {
+      io.to('rol_administrador de liga').emit('nuevo_mensaje', { 
+        remitente: remitente + ' (CC)', 
+        mensaje: mensaje, 
+        timestamp: timestamp, 
+        destinatario_sala: 'rol_administrador de liga',
+        propio: false 
+      });
+    }
+  });
+
+  socket.on('notificacion_oficiales_partido', (data) => {
+    if (data.arbitro_id) {
+      io.to(`usuario_${data.arbitro_id}`).emit('nuevo_mensaje', {
+        remitente: 'Sistema',
+        mensaje: data.mensaje,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    }
+    if (data.anotador_id) {
+      io.to(`usuario_${data.anotador_id}`).emit('nuevo_mensaje', {
+        remitente: 'Sistema',
+        mensaje: data.mensaje,
+        timestamp: new Date().toLocaleTimeString()
+      });
+    }
+  });
+
+  socket.on('sync_cronometro', (data) => {
+      io.to(`partido_${data.partido_id}`).emit('sincronizacion_cronometro', data);
+    });
+    
+  socket.on('enviar_notificacion_admin', (data) => {
+    io.to('rol_administrador de liga').emit('nuevo_mensaje', {
+      remitente: 'Sistema de Alertas Oficiales',
+      mensaje: data.mensaje,
+      timestamp: new Date().toLocaleTimeString()
+    });
+  });
+
+  // 1. Salas por partido
   socket.on('unirse_partido', (partidoId) => {
     const sala = `partido_${partidoId}`;
     socket.join(sala);
     console.log(`👤 Cliente ${socket.id} se unió a la sala: ${sala}`);
+    
+    if (partidosEnMemoria[partidoId]) {
+      socket.emit('actualizar_planilla', partidosEnMemoria[partidoId]);
+    }
   });
 
-  // 5.2. El Árbitro dicta una jugada (Arrime/Boche)
+  socket.on('presencia_oficial', (data) => {
+    const { partidoId, rol, estado } = data;
+    io.to(`partido_${partidoId}`).emit('presencia_actualizada', { rol, estado });
+  });
+
+  socket.on('proponer_jugada', (data) => {
+    const { partido_id, jugador_id, mano_index, valor } = data;
+    
+    if (!partidosEnMemoria[partido_id]) partidosEnMemoria[partido_id] = { efectividad: {} };
+    if (!partidosEnMemoria[partido_id].efectividad[jugador_id]) partidosEnMemoria[partido_id].efectividad[jugador_id] = {};
+    
+    partidosEnMemoria[partido_id].efectividad[jugador_id][mano_index] = { valor: valor, estado: 'validado' };
+    
+    io.to(`partido_${partido_id}`).emit('actualizar_planilla', partidosEnMemoria[partido_id]);
+  });
+
+  socket.on('sincronizar_planilla_completa', (data) => {
+    const { partido_id, efectividad, manualStats, tantosLocal, tantosVisita } = data;
+    if (!partidosEnMemoria[partido_id]) partidosEnMemoria[partido_id] = { efectividad: {} };
+    
+    partidosEnMemoria[partido_id].efectividad = efectividad || {};
+    partidosEnMemoria[partido_id].manualStats = manualStats || {};
+    partidosEnMemoria[partido_id].tantosLocal = tantosLocal || Array(20).fill('');
+    partidosEnMemoria[partido_id].tantosVisita = tantosVisita || Array(20).fill('');
+    
+    io.to(`partido_${partido_id}`).emit('actualizar_planilla', partidosEnMemoria[partido_id]);
+  });
+
+  socket.on('solicitar_revision_jugada', (data) => {
+    const { partido_id, jugador_id, mano_index, mensaje } = data;
+    
+    if (partidosEnMemoria[partido_id]?.efectividad[jugador_id]?.[mano_index]) {
+      partidosEnMemoria[partido_id].efectividad[jugador_id][mano_index].estado = 'rechazado';
+      
+      io.to(`partido_${partido_id}`).emit('actualizar_planilla', partidosEnMemoria[partido_id]);
+      io.to(`partido_${partido_id}`).emit('alerta_revision', mensaje);
+    }
+  });
+
   socket.on('decision_arbitro', async (data) => {
     try {
-      // Guardar la acción en la base de datos
       await db.query(
         `INSERT INTO public.detalle_jugadas (mano_id, jugador_id, tipo_destreza, efectividad, minuto_registro)
          VALUES ($1, $2, $3, $4, $5)`,
         [data.mano_id, data.jugador_id, data.tipo_destreza, data.efectividad, data.minuto_registro]
       );
-      
-      // Emitir el evento a todos en la sala del partido (incluyendo al Anotador)
       io.to(`partido_${data.partido_id}`).emit('bola_jugada_notificacion', data);
     } catch (error) {
       console.error('Error al registrar decisión del árbitro:', error);
     }
   });
 
-  // 5.3. El Árbitro saca una tarjeta
   socket.on('tarjeta_emitida', async (data) => {
     try {
       await db.query(
@@ -96,64 +210,57 @@ io.on('connection', (socket) => {
          VALUES ($1, $2, $3, $4)`,
         [data.partido_id, data.jugador_id, data.color, data.minuto_registro]
       );
-      
       io.to(`partido_${data.partido_id}`).emit('tarjeta_notificacion', data);
     } catch (error) {
       console.error('Error al emitir tarjeta:', error);
     }
   });
 
-  // 5.4. El Anotador registra el resultado de la mano (tiro)
+  socket.on('actualizar_stats_manuales', (data) => {
+    const { partido_id, manualStats } = data;
+    if (!partidosEnMemoria[partido_id]) partidosEnMemoria[partido_id] = { efectividad: {} };
+    partidosEnMemoria[partido_id].manualStats = manualStats;
+    io.to(`partido_${partido_id}`).emit('actualizar_planilla', partidosEnMemoria[partido_id]);
+  });
+
   socket.on('tantos_asignados', async (data) => {
+    const { partido_id, tantosLocal, tantosVisita } = data;
+    
+    if (!partidosEnMemoria[partido_id]) partidosEnMemoria[partido_id] = { efectividad: {} };
+    partidosEnMemoria[partido_id].tantosLocal = tantosLocal;
+    partidosEnMemoria[partido_id].tantosVisita = tantosVisita;
+    io.to(`partido_${partido_id}`).emit('actualizar_planilla', partidosEnMemoria[partido_id]);
+
     try {
-      // Nota: Aquí asumimos que la mano ya existe o se inserta dinámicamente
       await db.query(
         `INSERT INTO public.manos (partido_id, numero_mano, equipo_ganador_id, tantos_anotados)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (id) DO UPDATE SET equipo_ganador_id = $3, tantos_anotados = $4`,
         [data.partido_id, data.mano_id, data.equipo_ganador_id, data.tantos_anotados]
       );
-
-      // Actualizar la tabla de resultados consolidada
-      await db.query(
-        `UPDATE public.resultados 
-         SET marcador_local = $1, marcador_visita = $2 
-         WHERE partido_id = $3`,
-        [data.nuevo_marcador_local, data.nuevo_marcador_visita, data.partido_id]
-      );
-
-      // Notificar a todos los espectadores y roles en la sala
-      io.to(`partido_${data.partido_id}`).emit('marcador_actualizado', data);
     } catch (error) {
-      console.error('Error al registrar tantos:', error);
+      console.error('Error al registrar tantos en BD:', error);
     }
   });
 
-  // 5.5. El Anotador da por cerrado el partido
+  socket.on('partido_iniciado', (data) => {
+    if (!partidosEnMemoria[data.partidoId]) partidosEnMemoria[data.partidoId] = { efectividad: {} };
+    partidosEnMemoria[data.partidoId].estadoPartido = 'En Curso';
+    partidosEnMemoria[data.partidoId].hora_inicio = data.hora_inicio;
+    io.to(`partido_${data.partidoId}`).emit('actualizar_planilla', { estadoPartido: 'En Curso', hora_inicio: data.hora_inicio });
+  });
+
   socket.on('partido_finalizado', async (data) => {
-    try {
-      await db.query(
-        `UPDATE public.partidos SET estado = 'Finalizado' WHERE id = $1`,
-        [data.partido_id]
-      );
-      io.to(`partido_${data.partido_id}`).emit('fin_partido', data);
-    } catch (error) {
-      console.error('Error al finalizar el partido:', error);
-    }
+    if (!partidosEnMemoria[data.partidoId]) partidosEnMemoria[data.partidoId] = { efectividad: {} };
+    partidosEnMemoria[data.partidoId].estadoPartido = 'Finalizado';
+    partidosEnMemoria[data.partidoId].hora_final = data.hora_final;
+    io.to(`partido_${data.partidoId}`).emit('actualizar_planilla', { estadoPartido: 'Finalizado', hora_final: data.hora_final });
   });
 
-  // 5.6. El Árbitro suspende el partido (por lluvia, luz, etc.)
-  socket.on('suspender_partido', async (data) => {
-    try {
-      await db.query(
-        `UPDATE public.partidos SET estado = 'Suspendido' WHERE id = $1`,
-        [data.partido_id]
-      );
-      // Notificamos a toda la sala (Anotador y público)
-      io.to(`partido_${data.partido_id}`).emit('partido_suspendido', data);
-    } catch (error) {
-      console.error('Error al suspender el partido:', error);
-    }
+  socket.on('partido_suspendido', async (data) => {
+    if (!partidosEnMemoria[data.partidoId]) partidosEnMemoria[data.partidoId] = { efectividad: {} };
+    partidosEnMemoria[data.partidoId].estadoPartido = 'Suspendido';
+    io.to(`partido_${data.partidoId}`).emit('actualizar_planilla', { estadoPartido: 'Suspendido' });
   });
 
   socket.on('disconnect', () => {

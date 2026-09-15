@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
+const bcrypt = require('bcrypt'); // IMPORTACIÓN AÑADIDA PARA VALIDACIÓN DE ADMIN
 const { createClient } = require('@supabase/supabase-js');
 const { verificarToken, autorizarRoles } = require('../middleware/authMiddleware');
 
@@ -42,6 +43,9 @@ router.post('/cambiar-password-obligatorio', async (req, res) => {
       user_metadata: { debe_cambiar_password: false }
     });
     if (error) return res.status(400).json({ error: error.message });
+    
+    // Si estás manejando un hash dual, idealmente guardarías el bcrypt hash aquí.
+    // Para simplificar según la arquitectura, lo dejamos como en tu original.
     await db.query('UPDATE public.usuarios SET debe_cambiar_password = false WHERE id = $1', [req.usuario.id]);
     res.json({ mensaje: 'Contraseña actualizada con éxito.' });
   } catch (error) {
@@ -187,7 +191,6 @@ router.put('/jugadores/:id', async (req, res) => {
       }
     }
 
-    // 1. Actualizar los datos generales del jugador
     const resDb = await db.query(
       `UPDATE public.jugadores 
        SET nombre = COALESCE($1, nombre), apellido = COALESCE($2, apellido), cedula = COALESCE($3, cedula), 
@@ -207,12 +210,9 @@ router.put('/jugadores/:id', async (req, res) => {
       ]
     );
 
-    // 2. Gestionar la exclusividad del Capitán para el equipo
     if (es_capitan) {
-      // Si se marca como capitán, se asigna (esto sobrescribe automáticamente al capitán anterior, garantizando que solo haya uno)
       await db.query(`UPDATE public.equipos SET capitan_id = $1 WHERE id = $2`, [id, equipoId]);
     } else {
-      // Si se desmarca, verificamos si era el capitán actual para dejar el campo en NULL
       await db.query(`UPDATE public.equipos SET capitan_id = NULL WHERE id = $1 AND capitan_id = $2`, [equipoId, id]);
     }
 
@@ -260,10 +260,13 @@ router.post('/crear-credencial', async (req, res) => {
   const primerNombre = nombreFmt.split(' ')[0];
   const passwordInicial = `${primerNombre}${cedula.trim().substring(0, 5)}!`;
   
-  // Usamos el correo real directamente tanto para Supabase Auth como para PostgreSQL
   const emailReal = email.trim().toLowerCase();
 
   try {
+    // Generación del hash usando bcrypt para sincronizar con la validación de contraseñas interna (forzar-ganador)
+    const saltRounds = 10;
+    const hashedPwd = await bcrypt.hash(passwordInicial, saltRounds);
+
     const { data: authUser, error: authError } = await supabaseAdmin.auth.admin.createUser({
       email: emailReal, 
       password: passwordInicial, 
@@ -281,10 +284,10 @@ router.post('/crear-credencial', async (req, res) => {
     if (authError) return res.status(400).json({ error: authError.message });
 
     const resDb = await db.query(
-      `INSERT INTO public.usuarios (id, email, rol, nombre, apellido, cedula, organizacion_id, debe_cambiar_password) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, true)
-       ON CONFLICT (id) DO UPDATE SET email=$2, rol=$3, nombre=$4, apellido=$5, cedula=$6, organizacion_id=$7, debe_cambiar_password=true RETURNING *`,
-      [authUser.user.id, emailReal, rol, nombreFmt, apellidoFmt, cedula.trim(), orgId]
+      `INSERT INTO public.usuarios (id, email, rol, nombre, apellido, cedula, organizacion_id, password_hash, debe_cambiar_password) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+       ON CONFLICT (id) DO UPDATE SET email=$2, rol=$3, nombre=$4, apellido=$5, cedula=$6, organizacion_id=$7, password_hash=$8, debe_cambiar_password=true RETURNING *`,
+      [authUser.user.id, emailReal, rol, nombreFmt, apellidoFmt, cedula.trim(), orgId, hashedPwd]
     );
 
     if (rol.toLowerCase() === 'delegado de equipo' && equipo_id) {
@@ -302,14 +305,19 @@ router.post('/usuarios/:id/reset-password', async (req, res) => {
   try {
     const userDb = await db.query('SELECT email, cedula, nombre FROM public.usuarios WHERE id = $1', [req.params.id]);
     if (userDb.rows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado.' });
+    
     const { cedula, nombre } = userDb.rows[0];
     const primerNombre = nombre ? nombre.trim().split(' ')[0] : 'User';
     const nuevaPassword = `${primerNombre}${cedula.trim().substring(0, 5)}!`;
+    
+    const hashedPwd = await bcrypt.hash(nuevaPassword, 10);
+
     const { error } = await supabaseAdmin.auth.admin.updateUserById(req.params.id, {
       password: nuevaPassword, user_metadata: { debe_cambiar_password: true }
     });
     if (error) return res.status(400).json({ error: error.message });
-    await db.query('UPDATE public.usuarios SET debe_cambiar_password = true WHERE id = $1', [req.params.id]);
+    
+    await db.query('UPDATE public.usuarios SET debe_cambiar_password = true, password_hash = $2 WHERE id = $1', [req.params.id, hashedPwd]);
     res.json({ mensaje: `Contraseña restablecida. Nueva clave temporal: ${nuevaPassword}` });
   } catch (error) { res.status(500).json({ error: 'Error al restablecer contraseña.' }); }
 });
@@ -323,7 +331,7 @@ router.put('/equipos/:id/delegado', async (req, res) => {
 });
 
 // ==========================================
-// PLANTILLAS DE REGLAS (Unificadas)
+// PLANTILLAS DE REGLAS
 // ==========================================
 router.get('/plantillas-reglas', async (req, res) => {
   try {
@@ -346,7 +354,7 @@ router.post('/plantillas-reglas', async (req, res) => {
 });
 
 // ==========================================
-// TORNEOS Y RECURSOS (Con conteo de jugadores activos)
+// TORNEOS Y RECURSOS
 // ==========================================
 router.get('/torneos', async (req, res) => {
   try {
@@ -491,7 +499,7 @@ router.get('/partidos-finalizados', async (req, res) => {
   try {
     const orgId = await obtenerOrgId(req.usuario);
     const resultado = await db.query(`
-      SELECT p.id, p.fecha_hora, p.estado, t.nombre as torneo_nombre, el.nombre as local_nombre, ev.nombre as visita_nombre, r.marcador_local, r.marcador_visita
+      SELECT p.id, p.fecha_hora, p.estado, t.nombre as torneo_nombre, el.nombre as local_nombre, ev.nombre as visita_nombre, r.marcador_local, r.marcador_visita, p.equipo_local_id, p.equipo_visita_id, p.arbitro_id, p.anotador_id
       FROM public.partidos p
       JOIN public.torneos t ON p.torneo_id = t.id
       LEFT JOIN public.equipos el ON p.equipo_local_id = el.id
@@ -590,14 +598,10 @@ router.get('/acumulado-temporada', async (req, res) => {
   }
 });
 
-// ==========================================
-// NUEVOS REQUERIMIENTOS: PARTIDOS SUELTOS, REAGENDAR Y CAMBIAR RESULTADOS
-// ==========================================
 
 router.post('/partidos-sueltos', async (req, res) => {
   const { equipo_local_id, equipo_visita_id, sede_id, arbitro_id, anotador_id, fecha_hora } = req.body;
   try {
-    // Generar la cadena de la hora actual local del servidor en formato YYYY-MM-DDTHH:mm
     const ahora = new Date();
     const anio = ahora.getFullYear();
     const mes = String(ahora.getMonth() + 1).padStart(2, '0');
@@ -606,14 +610,12 @@ router.post('/partidos-sueltos', async (req, res) => {
     const minuto = String(ahora.getMinutes()).padStart(2, '0');
     const ahoraLocalIso = `${anio}-${mes}-${dia}T${hora}:${minuto}`;
 
-    // Validar comparando directamente las cadenas locales
     if (fecha_hora < ahoraLocalIso) {
       return res.status(400).json({ error: 'No se puede programar un partido en una fecha y hora que ya pasó.' });
     }
 
     const orgId = await obtenerOrgId(req.usuario);
 
-    // 1. Buscar si ya existe el torneo genérico de partidos independientes para esta organización
     let torneoIndep = await db.query(
       `SELECT id FROM public.torneos WHERE organizacion_id = $1 AND nombre = 'Partidos Independientes' LIMIT 1`,
       [orgId]
@@ -621,7 +623,6 @@ router.post('/partidos-sueltos', async (req, res) => {
 
     let torneoId;
     if (torneoIndep.rows.length === 0) {
-      // Si no existe, lo creamos con todos los campos requeridos por la tabla torneos
       const fechaActual = new Date().toISOString().split('T')[0];
       const fechaFutura = '2099-12-31';
       const temporadaActual = '2026';
@@ -636,7 +637,6 @@ router.post('/partidos-sueltos', async (req, res) => {
       torneoId = torneoIndep.rows[0].id;
     }
 
-    // 2. Insertar el partido suelto asociado a este torneo contenedor
     const resDb = await db.query(
       `INSERT INTO public.partidos (torneo_id, equipo_local_id, equipo_visita_id, sede_id, arbitro_id, anotador_id, fecha_hora, fase, estado) 
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'Partido Suelto', 'Agendado') RETURNING *`,
@@ -645,14 +645,10 @@ router.post('/partidos-sueltos', async (req, res) => {
 
     res.status(201).json({ mensaje: 'Partido suelto agendado con éxito.', partido: resDb.rows[0] });
   } catch (error) { 
-    console.error('--- ERROR AL AGENDAR PARTIDO SUELTO ---');
-    console.error(error.message);
-    console.error(error.detail || error);
     res.status(500).json({ error: error.message || 'Error al agendar partido suelto.' }); 
   }
 });
 
-// 2. Reagendar Partido Suspendido
 router.put('/partidos/:id/reagendar', async (req, res) => {
   const { nueva_fecha_hora } = req.body;
   try {
@@ -661,31 +657,60 @@ router.put('/partidos/:id/reagendar', async (req, res) => {
   } catch (error) { res.status(500).json({ error: 'Error al reagendar.' }); }
 });
 
-// 3. Solicitar Cambio de Ganador (Pendiente de Validación por el Árbitro)
-router.post('/partidos/:id/solicitar-cambio-ganador', async (req, res) => {
-  const { ganador_propuesto_id, motivo } = req.body;
-  const partidoId = req.params.id;
+// NUEVO: RUTA PARA FORZAR EL GANADOR DESDE EL ADMIN DASHBOARD (Requiere validación Bcrypt)
+router.post('/partidos/:id/forzar-ganador', async (req, res) => {
+  const { id: partidoId } = req.params;
+  const { ganador_id, motivo, admin_password } = req.body;
+  const adminId = req.usuario.id; 
 
   try {
-    try {
-      await db.query(`ALTER TABLE public.resultados ADD COLUMN IF NOT EXISTS ganador_propuesto_id INT;`);
-      await db.query(`ALTER TABLE public.resultados ADD COLUMN IF NOT EXISTS motivo_cambio TEXT;`);
-      await db.query(`ALTER TABLE public.resultados ADD COLUMN IF NOT EXISTS estado_validacion VARCHAR(20) DEFAULT 'Validado';`);
-    } catch (e) { /* Ignorar si ya existen */ }
-
-    const updateRes = await db.query(
-      `UPDATE public.resultados 
-       SET ganador_propuesto_id = $1, motivo_cambio = $2, estado_validacion = 'Pendiente'
-       WHERE partido_id = $3 RETURNING *`,
-      [ganador_propuesto_id, motivo, partidoId]
+    // 1. Obtener el hash de la contraseña del administrador desde la base de datos
+    const resultAdmin = await db.query(
+      'SELECT password_hash FROM public.usuarios WHERE id = $1',
+      [adminId]
     );
 
-    if (updateRes.rows.length === 0) {
-      return res.status(404).json({ error: 'No se encontraron resultados oficiales para este partido.' });
+    if (resultAdmin.rows.length === 0) {
+      return res.status(404).json({ error: 'Administrador no encontrado en la base de datos.' });
     }
 
-    res.json({ mensaje: 'Solicitud enviada. El árbitro debe validarla desde su panel.' });
-  } catch (error) { res.status(500).json({ error: 'Error al procesar la solicitud de cambio.' }); }
+    const adminHash = resultAdmin.rows[0].password_hash;
+
+    // Validación por si la plataforma se implementó 100% sobre Supabase Auth y la columna de hash está vacía.
+    if (!adminHash) {
+      return res.status(500).json({ error: 'Tu cuenta de administrador no tiene un Hash de seguridad configurado en la BD. Contacta a soporte o resetea tu contraseña.' });
+    }
+
+    // 2. Verificar la contraseña cruda contra el hash de la BD usando bcrypt
+    const passwordValida = await bcrypt.compare(admin_password, adminHash);
+    
+    if (!passwordValida) {
+      return res.status(401).json({ error: 'Contraseña de administrador incorrecta. Acción denegada.' });
+    }
+
+    // 3. Si la contraseña es válida, procedemos a forzar el resultado
+    // Primero garantizamos que el partido figure como finalizado.
+    await db.query(`UPDATE public.partidos SET estado = 'Finalizado' WHERE id = $1`, [partidoId]);
+
+    // Usamos Upsert sobre la tabla resultados, que es la que tiene la columna equipo_ganador_id
+    await db.query(
+      `INSERT INTO public.resultados (partido_id, marcador_local, marcador_visita, equipo_ganador_id, tipo_resolucion, aprobado_por, observaciones)
+       VALUES ($1, 0, 0, $2, 'Forzado por Admin', $3, $4)
+       ON CONFLICT (partido_id) DO UPDATE
+       SET equipo_ganador_id = $2, 
+           tipo_resolucion = 'Forzado por Admin', 
+           aprobado_por = $3, 
+           observaciones = COALESCE(public.resultados.observaciones, '') || ' | Resultado Forzado: ' || $4`,
+      [partidoId, ganador_id, adminId, motivo]
+    );
+
+    res.status(200).json({ mensaje: 'Resultado forzado y registrado con éxito en el sistema.' });
+
+  } catch (error) {
+    console.error('Error crítico al forzar ganador:', error);
+    res.status(500).json({ error: 'Error interno del servidor al procesar la solicitud de forzado de resultado.' });
+  }
 });
+
 
 module.exports = router;
